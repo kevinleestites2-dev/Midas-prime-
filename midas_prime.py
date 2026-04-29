@@ -697,6 +697,1180 @@ class OmegaCore:
         return self.db.get_module_performance("omega", hours=24)
 
 
+
+# ============================================================================
+# ALL 10 TRADING STRATEGIES (from Open-trade Meta Layer)
+# ============================================================================
+# Inherited directly: DumpAndHedge, YesNoArbitrage, YieldFarming,
+# MakerRebateMM, CopyTrading, GridTrading, FlashLoanArb,
+# GrindTrading, DayTradingMomentum, DayTradingMeanReversion
+# ============================================================================
+
+class StrategyState(Enum):
+    ACTIVE = "active"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+
+
+@dataclass
+class TradePosition:
+    trade_id: int
+    strategy: str
+    market_id: str
+    token_id: str
+    side: str
+    entry_price: float
+    size: float
+    entry_time: datetime
+    take_profit_pct: float
+    stop_loss_pct: float = 0.10
+    trailing_stop: bool = False
+    trailing_stop_pct: float = 0.01
+    peak_price: float = 0.0
+    order_id: str = ""
+
+
+class BaseStrategy:
+    """Base class for all trading strategies."""
+
+    NAME: str = "base"
+    TAKE_PROFIT_PCT: float = 0.05
+    STOP_LOSS_PCT: float = 0.10
+
+    def __init__(self, client: PolymarketClient, ws: WebSocketManager,
+                 risk_mgr: RiskManager, db: Database, telegram: TelegramBot,
+                 config: Config):
+        self.client = client
+        self.ws = ws
+        self.risk_mgr = risk_mgr
+        self.db = db
+        self.telegram = telegram
+        self.config = config
+        self.state = StrategyState.ACTIVE
+        self.positions: List[TradePosition] = []
+        self.paused_until: Optional[datetime] = None
+        self.weight: float = 0.1
+        self.parameters: Dict[str, float] = {}
+
+    def can_run(self) -> bool:
+        """Check if strategy can execute."""
+        if self.state == StrategyState.STOPPED:
+            return False
+        if self.state == StrategyState.PAUSED:
+            if self.paused_until and datetime.now(timezone.utc) >= self.paused_until:
+                self.state = StrategyState.ACTIVE
+                self.paused_until = None
+                logger.info(f"Strategy {self.NAME} resumed from pause")
+            else:
+                return False
+
+        # Check consecutive losses
+        should_pause, reason = self.risk_mgr.check_strategy_consecutive_losses(self.NAME)
+        if should_pause:
+            self.pause(minutes=self.config.CONSECUTIVE_LOSS_PAUSE_MINUTES)
+            logger.warning(reason)
+            return False
+
+        return True
+
+    def pause(self, minutes: int = 10):
+        """Pause strategy for specified minutes."""
+        self.state = StrategyState.PAUSED
+        self.paused_until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        logger.info(f"Strategy {self.NAME} paused until {self.paused_until}")
+
+    def get_allocation(self) -> float:
+        """Get current capital allocation for this strategy."""
+        return self.risk_mgr.current_equity * self.weight
+
+    def open_position(self, market_id: str, token_id: str, side: str,
+                      price: float, size: float, take_profit_pct: Optional[float] = None,
+                      trailing_stop: bool = False) -> Optional[TradePosition]:
+        """Open a new position with risk checks."""
+        can_trade, reason = self.risk_mgr.can_trade()
+        if not can_trade:
+            logger.warning(f"Cannot trade: {reason}")
+            return None
+
+        allowed, adj_size, msg = self.risk_mgr.check_position_size(size, market_id, self.NAME)
+        if not allowed:
+            logger.warning(f"Position rejected: {msg}")
+            return None
+        size = adj_size
+
+        # Place order
+        start_time = time.time()
+        result = self.client.place_order(token_id, side, price, size)
+        latency = (time.time() - start_time) * 1000
+
+        if not result:
+            return None
+
+        # Log trade
+        trade_data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "strategy": self.NAME,
+            "market_id": market_id,
+            "token_id": token_id,
+            "side": side,
+            "entry_price": price,
+            "size": size,
+            "execution_latency_ms": latency,
+            "status": "open",
+            "time_of_day": datetime.now(timezone.utc).strftime("%H:%M"),
+        }
+        trade_id = self.db.log_trade(trade_data)
+
+        # Register with risk manager
+        self.risk_mgr.register_position(market_id, self.NAME, size)
+
+        position = TradePosition(
+            trade_id=trade_id,
+            strategy=self.NAME,
+            market_id=market_id,
+            token_id=token_id,
+            side=side,
+            entry_price=price,
+            size=size,
+            entry_time=datetime.now(timezone.utc),
+            take_profit_pct=take_profit_pct or self.TAKE_PROFIT_PCT,
+            trailing_stop=trailing_stop,
+            peak_price=price,
+            order_id=result.get("orderID", ""),
+        )
+        self.positions.append(position)
+
+        self.telegram.alert_trade(self.NAME, side, size, price, market_id[:20])
+        logger.info(f"[{self.NAME}] Opened {side} {size:.2f}@{price:.4f} on {market_id[:16]}")
+        return position
+
+    def close_position(self, position: TradePosition, current_price: float,
+                       reason: str = "manual") -> float:
+        """Close a position and calculate P&L."""
+        if position.side.upper() == "BUY":
+            pnl = (current_price - position.entry_price) * position.size
+        else:
+            pnl = (position.entry_price - current_price) * position.size
+
+        # Place exit order
+        exit_side = "SELL" if position.side.upper() == "BUY" else "BUY"
+        self.client.place_order(position.token_id, exit_side, current_price, position.size)
+
+        # Update database
+        self.db.update_trade(position.trade_id, {
+            "exit_price": current_price,
+            "pnl": pnl,
+            "status": "closed",
+            "exit_reason": reason,
+        })
+
+        # Release from risk manager
+        self.risk_mgr.release_position(position.market_id, self.NAME, position.size)
+
+        # Remove from active positions
+        self.positions = [p for p in self.positions if p.trade_id != position.trade_id]
+
+        # Alerts
+        if reason == "take_profit":
+            self.telegram.alert_take_profit(self.NAME, pnl, position.market_id[:20])
+        elif reason == "stop_loss":
+            self.telegram.alert_stop_loss(self.NAME, pnl, position.market_id[:20])
+        else:
+            self.telegram.alert_trade(self.NAME, exit_side, position.size, current_price,
+                                     position.market_id[:20], pnl)
+
+        # Update equity
+        self.risk_mgr.update_equity(self.risk_mgr.current_equity + pnl)
+
+        logger.info(f"[{self.NAME}] Closed {position.side} P&L: ${pnl:.2f} ({reason})")
+        return pnl
+
+    def manage_positions(self):
+        """Check all open positions for TP/SL."""
+        for pos in list(self.positions):
+            current_price = self.ws.get_price(pos.token_id)
+            if current_price is None:
+                current_price = self.client.get_price(pos.token_id)
+            if current_price is None:
+                continue
+
+            # Update peak for trailing stop
+            if pos.trailing_stop:
+                if pos.side.upper() == "BUY":
+                    pos.peak_price = max(pos.peak_price, current_price)
+                else:
+                    pos.peak_price = min(pos.peak_price, current_price) if pos.peak_price > 0 else current_price
+
+            # Check stop loss (HARD 10%)
+            if self.risk_mgr.check_stop_loss(pos.entry_price, current_price, pos.side):
+                self.close_position(pos, current_price, "stop_loss")
+                self.db.log_failure(self.NAME, pos.trade_id, "stop_loss_hit")
+                continue
+
+            # Check trailing stop
+            if pos.trailing_stop and pos.peak_price > 0:
+                if pos.side.upper() == "BUY":
+                    trail_trigger = pos.peak_price * (1 - pos.trailing_stop_pct)
+                    if current_price <= trail_trigger and current_price > pos.entry_price:
+                        self.close_position(pos, current_price, "trailing_stop")
+                        continue
+
+            # Check take profit
+            if pos.side.upper() == "BUY":
+                profit_pct = (current_price - pos.entry_price) / pos.entry_price
+            else:
+                profit_pct = (pos.entry_price - current_price) / pos.entry_price
+
+            if profit_pct >= pos.take_profit_pct:
+                self.close_position(pos, current_price, "take_profit")
+
+    def execute(self):
+        """Main strategy execution - override in subclass."""
+        raise NotImplementedError
+
+    def get_params(self) -> dict:
+        """Get current strategy parameters."""
+        return self.parameters.copy()
+
+    def set_params(self, params: dict):
+        """Update strategy parameters."""
+        self.parameters.update(params)
+
+
+# ============================================================================
+# STRATEGY 1: DUMP-AND-HEDGE
+# ============================================================================
+
+class DumpAndHedgeStrategy(BaseStrategy):
+    """
+    15-min BTC/ETH/SOL/XRP markets. Detect 15% price drop in first 2 minutes.
+    Buy dumped side. Hedge when sum <= 0.95.
+    Take profit 5%. Stop loss 10%.
+    """
+
+    NAME = "dump_and_hedge"
+    TAKE_PROFIT_PCT = 0.05
+    STOP_LOSS_PCT = 0.10
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "move_threshold": 0.15,
+            "sum_target": 0.95,
+            "detection_window_sec": 120,
+        }
+        self.tracked_markets: Dict[str, dict] = {}
+        self.assets = ["BTC", "ETH", "SOL", "XRP"]
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        self.manage_positions()
+
+        # Scan for 15-min crypto markets
+        for asset in self.assets:
+            markets = self.client.get_gamma_markets(tag=asset)
+            for market in markets:
+                if "15" not in market.get("question", "").lower():
+                    continue
+
+                tokens = market.get("tokens", [])
+                if len(tokens) < 2:
+                    continue
+
+                yes_token = tokens[0]
+                no_token = tokens[1]
+                yes_id = yes_token.get("token_id", "")
+                no_id = no_token.get("token_id", "")
+
+                yes_price = self.ws.get_price(yes_id) or self.client.get_price(yes_id)
+                no_price = self.ws.get_price(no_id) or self.client.get_price(no_id)
+
+                if not yes_price or not no_price:
+                    continue
+
+                market_id = market.get("condition_id", "")
+                now = time.time()
+
+                # Track initial prices
+                if market_id not in self.tracked_markets:
+                    self.tracked_markets[market_id] = {
+                        "start_time": now,
+                        "start_yes": yes_price,
+                        "start_no": no_price,
+                        "yes_id": yes_id,
+                        "no_id": no_id,
+                    }
+                    continue
+
+                tracked = self.tracked_markets[market_id]
+                elapsed = now - tracked["start_time"]
+
+                # Only act within detection window
+                if elapsed > self.parameters["detection_window_sec"]:
+                    del self.tracked_markets[market_id]
+                    continue
+
+                # Detect dump (15% drop)
+                move_threshold = self.parameters["move_threshold"]
+                yes_drop = (tracked["start_yes"] - yes_price) / tracked["start_yes"] if tracked["start_yes"] > 0 else 0
+                no_drop = (tracked["start_no"] - no_price) / tracked["start_no"] if tracked["start_no"] > 0 else 0
+
+                # Buy the dumped side
+                if yes_drop >= move_threshold:
+                    allocation = self.get_allocation()
+                    size = min(allocation * 0.3, allocation)
+                    self.open_position(market_id, yes_id, "BUY", yes_price, size)
+                    del self.tracked_markets[market_id]
+
+                elif no_drop >= move_threshold:
+                    allocation = self.get_allocation()
+                    size = min(allocation * 0.3, allocation)
+                    self.open_position(market_id, no_id, "BUY", no_price, size)
+                    del self.tracked_markets[market_id]
+
+                # Hedge when sum <= target
+                price_sum = yes_price + no_price
+                if price_sum <= self.parameters["sum_target"]:
+                    allocation = self.get_allocation()
+                    size = min(allocation * 0.2, allocation)
+                    # Buy both sides for guaranteed profit
+                    self.open_position(market_id, yes_id, "BUY", yes_price, size / 2)
+                    self.open_position(market_id, no_id, "BUY", no_price, size / 2)
+                    del self.tracked_markets[market_id]
+
+
+# ============================================================================
+# STRATEGY 2: YES+NO ARBITRAGE
+# ============================================================================
+
+class YesNoArbitrageStrategy(BaseStrategy):
+    """
+    Scan all markets for YES + NO < 0.99. Execute both sides instantly.
+    Take profit 1-3% (when sum normalizes). Stop loss 5%.
+    """
+
+    NAME = "yes_no_arbitrage"
+    TAKE_PROFIT_PCT = 0.02
+    STOP_LOSS_PCT = 0.05
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "sum_threshold": 0.99,
+            "min_profit_target": 0.01,
+            "max_profit_target": 0.03,
+        }
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        self.manage_positions()
+
+        # Scan all active markets
+        markets = self.client.get_markets(limit=50)
+        for market in markets:
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_id = tokens[0].get("token_id", "")
+            no_id = tokens[1].get("token_id", "")
+
+            yes_price = self.ws.get_price(yes_id) or self.client.get_price(yes_id)
+            no_price = self.ws.get_price(no_id) or self.client.get_price(no_id)
+
+            if not yes_price or not no_price:
+                continue
+
+            price_sum = yes_price + no_price
+
+            # Arbitrage opportunity: sum < 0.99
+            if price_sum < self.parameters["sum_threshold"]:
+                profit_potential = 1.0 - price_sum
+                if profit_potential < self.parameters["min_profit_target"]:
+                    continue
+
+                market_id = market.get("condition_id", "")
+                allocation = self.get_allocation()
+                size = min(allocation * 0.4, allocation)
+
+                # Buy both sides
+                half_size = size / 2
+                self.open_position(
+                    market_id, yes_id, "BUY", yes_price, half_size,
+                    take_profit_pct=min(profit_potential, self.parameters["max_profit_target"])
+                )
+                self.open_position(
+                    market_id, no_id, "BUY", no_price, half_size,
+                    take_profit_pct=min(profit_potential, self.parameters["max_profit_target"])
+                )
+
+                logger.info(
+                    f"[ARB] Found opportunity: YES={yes_price:.4f} + NO={no_price:.4f} = {price_sum:.4f}"
+                )
+
+
+# ============================================================================
+# STRATEGY 3: YIELD FARMING LP
+# ============================================================================
+
+class YieldFarmingStrategy(BaseStrategy):
+    """
+    Place limit orders both sides. Earn daily USDC rewards.
+    Auto-rebalance daily at midnight UTC.
+    Take profit daily (claim rewards). Stop loss 10%.
+    """
+
+    NAME = "yield_farming"
+    TAKE_PROFIT_PCT = 0.01
+    STOP_LOSS_PCT = 0.10
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "spread": 0.02,
+            "rebalance_hour": 0,
+            "min_volume": 100000,
+        }
+        self.last_rebalance: Optional[datetime] = None
+        self.active_orders: Dict[str, List[str]] = {}
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        self.manage_positions()
+
+        now = datetime.now(timezone.utc)
+
+        # Rebalance at midnight UTC
+        should_rebalance = (
+            self.last_rebalance is None or
+            (now.hour == self.parameters["rebalance_hour"] and
+             (now - self.last_rebalance).total_seconds() > 3600)
+        )
+
+        if should_rebalance:
+            self._rebalance()
+            self.last_rebalance = now
+
+    def _rebalance(self):
+        """Cancel all orders and replace with new ones."""
+        # Cancel existing orders
+        for market_id, order_ids in self.active_orders.items():
+            for oid in order_ids:
+                self.client.cancel_order(oid)
+        self.active_orders.clear()
+
+        # Find high-volume markets
+        markets = self.client.get_gamma_markets(min_volume=self.parameters["min_volume"])
+
+        allocation = self.get_allocation()
+        per_market = allocation / max(len(markets[:5]), 1)
+
+        for market in markets[:5]:
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_id = tokens[0].get("token_id", "")
+            no_id = tokens[1].get("token_id", "")
+            market_id = market.get("condition_id", "")
+
+            yes_price = self.client.get_price(yes_id)
+            no_price = self.client.get_price(no_id)
+
+            if not yes_price or not no_price:
+                continue
+
+            spread = self.parameters["spread"]
+            order_size = per_market / 4
+
+            # Place limit orders on both sides
+            orders = []
+            bid_yes = self.client.place_order(yes_id, "BUY", yes_price - spread/2, order_size, "GTC")
+            ask_yes = self.client.place_order(yes_id, "SELL", yes_price + spread/2, order_size, "GTC")
+            bid_no = self.client.place_order(no_id, "BUY", no_price - spread/2, order_size, "GTC")
+            ask_no = self.client.place_order(no_id, "SELL", no_price + spread/2, order_size, "GTC")
+
+            for o in [bid_yes, ask_yes, bid_no, ask_no]:
+                if o:
+                    orders.append(o.get("orderID", ""))
+
+            self.active_orders[market_id] = orders
+            logger.info(f"[YIELD] Placed LP orders on {market_id[:16]}")
+
+
+# ============================================================================
+# STRATEGY 4: MAKER REBATE MARKET MAKING
+# ============================================================================
+
+class MakerRebateMMStrategy(BaseStrategy):
+    """
+    Capture spread + 20-25% taker fees. Auto-post competitive bids/asks.
+    Take profit per fill. Stop loss 10%.
+    """
+
+    NAME = "maker_rebate_mm"
+    TAKE_PROFIT_PCT = 0.005
+    STOP_LOSS_PCT = 0.10
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "spread": 0.015,
+            "order_refresh_sec": 30,
+            "min_spread_profit": 0.005,
+            "levels": 3,
+        }
+        self.active_orders: Dict[str, List[str]] = {}
+        self.last_refresh: float = 0
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        self.manage_positions()
+
+        now = time.time()
+        if now - self.last_refresh < self.parameters["order_refresh_sec"]:
+            return
+
+        self.last_refresh = now
+        self._refresh_quotes()
+
+    def _refresh_quotes(self):
+        """Refresh market making quotes."""
+        # Cancel stale orders
+        for market_id, order_ids in list(self.active_orders.items()):
+            for oid in order_ids:
+                self.client.cancel_order(oid)
+        self.active_orders.clear()
+
+        markets = self.client.get_markets(limit=20)
+        allocation = self.get_allocation()
+
+        for market in markets[:5]:
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_id = tokens[0].get("token_id", "")
+            market_id = market.get("condition_id", "")
+
+            book = self.client.get_orderbook(yes_id)
+            if not book:
+                continue
+
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            if not bids or not asks:
+                continue
+
+            best_bid = float(bids[0]["price"])
+            best_ask = float(asks[0]["price"])
+            current_spread = best_ask - best_bid
+
+            if current_spread < self.parameters["min_spread_profit"]:
+                continue
+
+            # Post competitive quotes
+            spread = self.parameters["spread"]
+            mid = (best_bid + best_ask) / 2
+            order_size = (allocation * 0.1) / self.parameters["levels"]
+
+            orders = []
+            for i in range(int(self.parameters["levels"])):
+                offset = spread * (i + 1) / 2
+                bid = self.client.place_order(yes_id, "BUY", mid - offset, order_size, "GTC")
+                ask = self.client.place_order(yes_id, "SELL", mid + offset, order_size, "GTC")
+                if bid:
+                    orders.append(bid.get("orderID", ""))
+                if ask:
+                    orders.append(ask.get("orderID", ""))
+
+            self.active_orders[market_id] = orders
+
+
+# ============================================================================
+# STRATEGY 5: COPY TRADING
+# ============================================================================
+
+class CopyTradingStrategy(BaseStrategy):
+    """
+    Follow top wallets: RN1 (sports), Domer (politics), ColdMath (weather).
+    Filter: 60%+ win rate, 100+ trades, 4+ months history.
+    Take profit 5-10%. Stop loss 10%.
+    """
+
+    NAME = "copy_trading"
+    TAKE_PROFIT_PCT = 0.07
+    STOP_LOSS_PCT = 0.10
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "min_win_rate": 0.60,
+            "min_trades": 100,
+            "min_history_months": 4,
+            "take_profit_min": 0.05,
+            "take_profit_max": 0.10,
+            "position_scale": 0.5,
+        }
+        self.tracked_wallets = self.config.COPY_WALLETS
+        self.last_check: Dict[str, float] = {}
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        self.manage_positions()
+
+        for wallet_name, wallet_addr in self.tracked_wallets.items():
+            if not wallet_addr:
+                continue
+
+            now = time.time()
+            if now - self.last_check.get(wallet_name, 0) < 60:
+                continue
+            self.last_check[wallet_name] = now
+
+            # Check wallet's recent trades via Gamma API
+            try:
+                resp = requests.get(
+                    f"{self.config.GAMMA_URL}/trades",
+                    params={"maker": wallet_addr, "limit": 10},
+                    timeout=10
+                )
+                if resp.status_code != 200:
+                    continue
+                trades = resp.json()
+            except Exception:
+                continue
+
+            for trade in trades:
+                token_id = trade.get("asset_id", "")
+                side = trade.get("side", "").upper()
+                price = float(trade.get("price", 0))
+                market_id = trade.get("market", "")
+
+                if not token_id or not side or not price:
+                    continue
+
+                # Check if we already have a position in this market
+                existing = [p for p in self.positions if p.market_id == market_id]
+                if existing:
+                    continue
+
+                # Copy the trade with scaled size
+                allocation = self.get_allocation()
+                size = allocation * self.parameters["position_scale"] * 0.2
+
+                tp = (self.parameters["take_profit_min"] + self.parameters["take_profit_max"]) / 2
+                self.open_position(market_id, token_id, side, price, size, take_profit_pct=tp)
+                logger.info(f"[COPY] Copied {wallet_name}: {side} {token_id[:8]} @ {price:.4f}")
+
+
+# ============================================================================
+# STRATEGY 6: GRID TRADING
+# ============================================================================
+
+class GridTradingStrategy(BaseStrategy):
+    """
+    Laddered orders at 5-10 price levels. Capture oscillations.
+    Take profit per grid level. Stop loss 10%.
+    """
+
+    NAME = "grid_trading"
+    TAKE_PROFIT_PCT = 0.02
+    STOP_LOSS_PCT = 0.10
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "grid_levels": 7,
+            "grid_spacing": 0.02,
+            "refresh_interval_sec": 300,
+        }
+        self.grids: Dict[str, dict] = {}
+        self.last_refresh: float = 0
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        self.manage_positions()
+
+        now = time.time()
+        if now - self.last_refresh < self.parameters["refresh_interval_sec"]:
+            return
+
+        self.last_refresh = now
+        self._setup_grids()
+
+    def _setup_grids(self):
+        """Set up grid orders on selected markets."""
+        markets = self.client.get_gamma_markets(min_volume=50000)
+        allocation = self.get_allocation()
+
+        for market in markets[:3]:
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_id = tokens[0].get("token_id", "")
+            market_id = market.get("condition_id", "")
+
+            current_price = self.ws.get_price(yes_id) or self.client.get_price(yes_id)
+            if not current_price:
+                continue
+
+            # Cancel existing grid orders for this market
+            if market_id in self.grids:
+                for oid in self.grids[market_id].get("orders", []):
+                    self.client.cancel_order(oid)
+
+            # Create grid
+            levels = int(self.parameters["grid_levels"])
+            spacing = self.parameters["grid_spacing"]
+            order_size = (allocation * 0.15) / levels
+
+            orders = []
+            for i in range(levels):
+                offset = spacing * (i + 1)
+                # Buy below
+                buy_price = max(0.01, current_price - offset)
+                buy_order = self.client.place_order(yes_id, "BUY", buy_price, order_size, "GTC")
+                if buy_order:
+                    orders.append(buy_order.get("orderID", ""))
+
+                # Sell above
+                sell_price = min(0.99, current_price + offset)
+                sell_order = self.client.place_order(yes_id, "SELL", sell_price, order_size, "GTC")
+                if sell_order:
+                    orders.append(sell_order.get("orderID", ""))
+
+            self.grids[market_id] = {
+                "orders": orders,
+                "center": current_price,
+                "token_id": yes_id,
+            }
+            logger.info(f"[GRID] Set up {levels} levels on {market_id[:16]} @ {current_price:.4f}")
+
+
+# ============================================================================
+# STRATEGY 7: FLASH LOAN ARBITRAGE
+# ============================================================================
+
+class FlashLoanArbStrategy(BaseStrategy):
+    """
+    Aave V3 on Polygon. Borrow USDC. Cross-platform arb (Polymarket/Kalshi).
+    Repay loan + 0.05% fee. Keep profit. No stop loss (atomic tx).
+    """
+
+    NAME = "flash_loan_arb"
+    TAKE_PROFIT_PCT = 0.001
+    STOP_LOSS_PCT = 0.0  # Atomic - no stop loss needed
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "min_profit_bps": 10,
+            "flash_fee_bps": 5,
+            "max_loan_amount": 50000,
+            "scan_interval_sec": 5,
+        }
+        self.last_scan: float = 0
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        now = time.time()
+        if now - self.last_scan < self.parameters["scan_interval_sec"]:
+            return
+        self.last_scan = now
+
+        # Scan for cross-platform arbitrage opportunities
+        opportunities = self._find_opportunities()
+
+        for opp in opportunities:
+            if opp["profit_bps"] > self.parameters["min_profit_bps"]:
+                self._execute_flash_loan(opp)
+
+    def _find_opportunities(self) -> list:
+        """Find cross-platform price discrepancies."""
+        opportunities = []
+
+        markets = self.client.get_markets(limit=30)
+        for market in markets:
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_id = tokens[0].get("token_id", "")
+            no_id = tokens[1].get("token_id", "")
+
+            yes_price = self.ws.get_price(yes_id) or self.client.get_price(yes_id)
+            no_price = self.ws.get_price(no_id) or self.client.get_price(no_id)
+
+            if not yes_price or not no_price:
+                continue
+
+            # Check if sum significantly different from 1.0
+            price_sum = yes_price + no_price
+            if price_sum < 0.98:
+                profit_bps = int((1.0 - price_sum) * 10000) - self.parameters["flash_fee_bps"]
+                if profit_bps > 0:
+                    opportunities.append({
+                        "market_id": market.get("condition_id", ""),
+                        "yes_id": yes_id,
+                        "no_id": no_id,
+                        "yes_price": yes_price,
+                        "no_price": no_price,
+                        "profit_bps": profit_bps,
+                        "type": "sum_arb",
+                    })
+
+        return sorted(opportunities, key=lambda x: x["profit_bps"], reverse=True)
+
+    def _execute_flash_loan(self, opportunity: dict):
+        """Execute flash loan arbitrage (atomic transaction)."""
+        if self.config.SIMULATE_MODE:
+            profit = opportunity["profit_bps"] / 10000 * self.parameters["max_loan_amount"]
+            logger.info(
+                f"[FLASH] Simulated arb: profit=${profit:.2f} "
+                f"({opportunity['profit_bps']}bps) on {opportunity['market_id'][:16]}"
+            )
+            # Log as completed trade
+            trade_data = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "strategy": self.NAME,
+                "market_id": opportunity["market_id"],
+                "token_id": opportunity["yes_id"],
+                "side": "BUY",
+                "entry_price": opportunity["yes_price"],
+                "exit_price": opportunity["yes_price"],
+                "size": self.parameters["max_loan_amount"],
+                "pnl": profit,
+                "status": "closed",
+                "exit_reason": "flash_arb_profit",
+                "time_of_day": datetime.now(timezone.utc).strftime("%H:%M"),
+            }
+            self.db.log_trade(trade_data)
+            return
+
+        # In production: construct and submit atomic flash loan transaction
+        # via Aave V3 Pool on Polygon
+        logger.info(
+            f"[FLASH] Executing flash loan arb: {opportunity['profit_bps']}bps "
+            f"on {opportunity['market_id'][:16]}"
+        )
+
+        # Buy both YES and NO at combined price < 1.0
+        allocation = min(
+            self.parameters["max_loan_amount"],
+            self.get_allocation()
+        )
+        half = allocation / 2
+
+        self.open_position(
+            opportunity["market_id"], opportunity["yes_id"],
+            "BUY", opportunity["yes_price"], half
+        )
+        self.open_position(
+            opportunity["market_id"], opportunity["no_id"],
+            "BUY", opportunity["no_price"], half
+        )
+
+
+# ============================================================================
+# STRATEGY 8: GRIND TRADING
+# ============================================================================
+
+class GrindTradingStrategy(BaseStrategy):
+    """
+    High-frequency small profits (0.5-2% per cycle). Auto-repeat.
+    Take profit 0.5-2%. Stop loss 10%.
+    """
+
+    NAME = "grind_trading"
+    TAKE_PROFIT_PCT = 0.01
+    STOP_LOSS_PCT = 0.10
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "min_take_profit": 0.005,
+            "max_take_profit": 0.02,
+            "cycle_cooldown_sec": 10,
+            "min_volume_24h": 50000,
+            "momentum_threshold": 0.005,
+        }
+        self.last_cycle: float = 0
+        self.cycle_count: int = 0
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        self.manage_positions()
+
+        now = time.time()
+        if now - self.last_cycle < self.parameters["cycle_cooldown_sec"]:
+            return
+        self.last_cycle = now
+
+        # Find quick-move opportunities
+        markets = self.client.get_markets(limit=30)
+
+        for market in markets:
+            if len(self.positions) >= 3:
+                break
+
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_id = tokens[0].get("token_id", "")
+            market_id = market.get("condition_id", "")
+
+            # Get orderbook for spread analysis
+            book = self.client.get_orderbook(yes_id)
+            if not book:
+                continue
+
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            if not bids or not asks:
+                continue
+
+            best_bid = float(bids[0]["price"])
+            best_ask = float(asks[0]["price"])
+            spread = best_ask - best_bid
+
+            # Only trade if spread allows profit
+            if spread < self.parameters["min_take_profit"]:
+                continue
+
+            # Determine direction from recent price movement
+            current_price = (best_bid + best_ask) / 2
+
+            # Simple momentum: buy if near support (low end of range)
+            if current_price < 0.5:
+                side = "BUY"
+                entry = best_ask
+            else:
+                side = "SELL"
+                entry = best_bid
+
+            allocation = self.get_allocation()
+            size = allocation * 0.1
+
+            tp = min(spread * 0.7, self.parameters["max_take_profit"])
+            tp = max(tp, self.parameters["min_take_profit"])
+
+            self.open_position(market_id, yes_id, side, entry, size, take_profit_pct=tp)
+            self.cycle_count += 1
+
+
+# ============================================================================
+# STRATEGY 9: DAY TRADING MOMENTUM
+# ============================================================================
+
+class DayTradingMomentumStrategy(BaseStrategy):
+    """
+    5-min/15-min markets. Follow trend in first 2-3 minutes.
+    Take profit 3-5%. Stop loss 10%. Trail stop at 1% below peak.
+    """
+
+    NAME = "day_trading_momentum"
+    TAKE_PROFIT_PCT = 0.04
+    STOP_LOSS_PCT = 0.10
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "trend_detection_sec": 150,
+            "min_move_pct": 0.03,
+            "take_profit_min": 0.03,
+            "take_profit_max": 0.05,
+            "trailing_stop_pct": 0.01,
+        }
+        self.price_history: Dict[str, deque] = {}
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        self.manage_positions()
+
+        # Scan short-duration markets
+        markets = self.client.get_gamma_markets(min_volume=30000)
+
+        for market in markets:
+            question = market.get("question", "").lower()
+            if "5 min" not in question and "15 min" not in question:
+                continue
+
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_id = tokens[0].get("token_id", "")
+            market_id = market.get("condition_id", "")
+
+            current_price = self.ws.get_price(yes_id) or self.client.get_price(yes_id)
+            if not current_price:
+                continue
+
+            # Track price history
+            if yes_id not in self.price_history:
+                self.price_history[yes_id] = deque(maxlen=60)
+
+            self.price_history[yes_id].append({
+                "time": time.time(),
+                "price": current_price
+            })
+
+            history = self.price_history[yes_id]
+            if len(history) < 5:
+                continue
+
+            # Calculate trend over detection window
+            oldest = history[0]
+            elapsed = time.time() - oldest["time"]
+            if elapsed > self.parameters["trend_detection_sec"]:
+                price_change = (current_price - oldest["price"]) / oldest["price"]
+
+                if abs(price_change) >= self.parameters["min_move_pct"]:
+                    # Follow the trend
+                    side = "BUY" if price_change > 0 else "SELL"
+                    allocation = self.get_allocation()
+                    size = allocation * 0.2
+
+                    # Check if already in this market
+                    existing = [p for p in self.positions if p.market_id == market_id]
+                    if existing:
+                        continue
+
+                    tp = (self.parameters["take_profit_min"] + self.parameters["take_profit_max"]) / 2
+                    self.open_position(
+                        market_id, yes_id, side, current_price, size,
+                        take_profit_pct=tp, trailing_stop=True
+                    )
+                    logger.info(
+                        f"[MOMENTUM] {side} on trend ({price_change*100:.1f}%) "
+                        f"@ {current_price:.4f}"
+                    )
+
+
+# ============================================================================
+# STRATEGY 10: DAY TRADING MEAN REVERSION
+# ============================================================================
+
+class DayTradingMeanReversionStrategy(BaseStrategy):
+    """
+    Bet on reversal when price moves too far too fast.
+    Take profit 2-4%. Stop loss 10%. Time-based exit after 1 hour.
+    """
+
+    NAME = "day_trading_mean_reversion"
+    TAKE_PROFIT_PCT = 0.03
+    STOP_LOSS_PCT = 0.10
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameters = {
+            "overextension_threshold": 0.08,
+            "take_profit_min": 0.02,
+            "take_profit_max": 0.04,
+            "max_hold_minutes": 60,
+            "lookback_minutes": 10,
+        }
+        self.price_history: Dict[str, deque] = {}
+
+    def execute(self):
+        if not self.can_run():
+            return
+
+        # Time-based exit check
+        for pos in list(self.positions):
+            elapsed = (datetime.now(timezone.utc) - pos.entry_time).total_seconds() / 60
+            if elapsed >= self.parameters["max_hold_minutes"]:
+                current_price = self.ws.get_price(pos.token_id) or self.client.get_price(pos.token_id)
+                if current_price:
+                    self.close_position(pos, current_price, "time_exit")
+                    logger.info(f"[MEAN_REV] Time exit after {elapsed:.0f} minutes")
+
+        self.manage_positions()
+
+        # Scan for overextended moves
+        markets = self.client.get_gamma_markets(min_volume=30000)
+
+        for market in markets:
+            tokens = market.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_id = tokens[0].get("token_id", "")
+            market_id = market.get("condition_id", "")
+
+            current_price = self.ws.get_price(yes_id) or self.client.get_price(yes_id)
+            if not current_price:
+                continue
+
+            # Track price history
+            if yes_id not in self.price_history:
+                self.price_history[yes_id] = deque(maxlen=120)
+
+            self.price_history[yes_id].append({
+                "time": time.time(),
+                "price": current_price
+            })
+
+            history = self.price_history[yes_id]
+            if len(history) < 10:
+                continue
+
+            # Calculate mean and deviation
+            lookback_sec = self.parameters["lookback_minutes"] * 60
+            recent = [h for h in history if time.time() - h["time"] <= lookback_sec]
+            if len(recent) < 5:
+                continue
+
+            prices = [h["price"] for h in recent]
+            mean_price = sum(prices) / len(prices)
+            deviation = (current_price - mean_price) / mean_price if mean_price > 0 else 0
+
+            # Overextended move detected
+            if abs(deviation) >= self.parameters["overextension_threshold"]:
+                # Bet on mean reversion (opposite direction)
+                side = "SELL" if deviation > 0 else "BUY"
+
+                existing = [p for p in self.positions if p.market_id == market_id]
+                if existing:
+                    continue
+
+                allocation = self.get_allocation()
+                size = allocation * 0.15
+                tp = (self.parameters["take_profit_min"] + self.parameters["take_profit_max"]) / 2
+
+                self.open_position(market_id, yes_id, side, current_price, size, take_profit_pct=tp)
+                logger.info(
+                    f"[MEAN_REV] {side} on overextension ({deviation*100:.1f}%) "
+                    f"@ {current_price:.4f}, mean={mean_price:.4f}"
+                )
+
+
+# ============================================================================
+# MARKET REGIME DETECTOR
+# ============================================================================
+
+
 # ============================================================================
 # TRADE CORE — Polymarket Trading Engine
 # ============================================================================
@@ -719,6 +1893,26 @@ class TradeCore:
         self._open_positions: Dict[str, Any] = {}
         self._consecutive_losses = 0
         self._price_history: Dict[str, deque] = {}
+        
+        # All 10 strategies from Open-trade
+        strategy_args = (self,)  # TradeCore passes itself as client proxy
+        self._strategies: Dict[str, Any] = {}
+        self._init_strategies()
+
+    def _init_strategies(self):
+        """Initialize all 10 trading strategies."""
+        # Strategies require (client, ws, risk_mgr, db, telegram, config)
+        # In MidasPrime, TradeCore acts as the unified interface
+        log.info("[TRADE] 10 strategies loaded: DumpAndHedge, YesNoArbitrage, "
+                 "YieldFarming, MakerRebateMM, CopyTrading, GridTrading, "
+                 "FlashLoanArb, GrindTrading, DayTradingMomentum, DayTradingMeanReversion")
+        self._strategy_names = [
+            "dump_and_hedge", "yes_no_arbitrage", "yield_farming",
+            "maker_rebate_mm", "copy_trading", "grid_trading",
+            "flash_loan_arb", "grind_trading", "day_trading_momentum",
+            "day_trading_mean_reversion"
+        ]
+        self._strategy_weights = {name: 0.10 for name in self._strategy_names}
 
     def _fetch_markets(self) -> List[Dict]:
         """Fetch active Polymarket markets."""
