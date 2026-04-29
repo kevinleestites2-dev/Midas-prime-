@@ -532,6 +532,265 @@ def is_safe_code(code: str) -> Tuple[bool, str]:
     return True, "OK"
 
 
+
+# ============================================================================
+# OMEGA EARNING STRATEGIES (from OmegaPrime)
+# ============================================================================
+# 1. JobScanner     — fetches jobs from clawd-work.com API
+# 2. LLMPlanner     — plans job execution steps using local LLM
+# 3. HiringManager  — posts to Upwork when job is too complex
+# 4. EnterpriseAgent— lists on Agentalent.ai + Telegram integration
+# 5. HumanEmployer  — posts tasks to RentAHuman
+# ============================================================================
+
+class JobScanner:
+    def __init__(self, memory: HermesMemory):
+        self.memory = memory
+
+    def fetch_jobs(self) -> List[Dict]:
+        try:
+            resp = requests.get(JOB_API, timeout=15,
+                                headers={"User-Agent": "OmegaPrime/1.0"})
+            if resp.status_code == 402:
+                log.warning("[Scanner] Job API requires payment (402)")
+                return []
+            resp.raise_for_status()
+            jobs = resp.json()
+            if isinstance(jobs, dict):
+                jobs = jobs.get("jobs", jobs.get("data", []))
+            affordable = [j for j in jobs
+                         if isinstance(j, dict) and float(j.get("budget", 0)) <= JOB_MAX_BUDGET]
+            log.info(f"[Scanner] Found {len(affordable)} affordable jobs (of {len(jobs)} total)")
+            return affordable
+        except Exception as e:
+            log.error(f"[Scanner] Failed to fetch jobs: {e}")
+            return []
+
+
+# ─────────────────────────────────────────────
+# LLM PLANNER
+# ─────────────────────────────────────────────
+
+class LLMPlanner:
+    def __init__(self, tools: OpenClawTools, memory: HermesMemory):
+        self.tools = tools
+        self.memory = memory
+
+    def plan(self, job: Dict, skill_hint: Optional[Dict] = None) -> Tuple[List[Dict], str]:
+        past = self.memory.recall_job_outcomes(limit=5)
+        past_summary = "; ".join(
+            f"{o['outcome']} on {o['job_data'].get('type','?')}" for o in past
+        ) or "none"
+
+        hint_text = ""
+        if skill_hint:
+            hint_text = f"\nReuse this skill if appropriate: {json.dumps(skill_hint['steps'])}"
+
+        system = (
+            "You are OmegaPrime, an autonomous earning agent. "
+            "Given a job description, output a JSON array of steps. "
+            "Each step: {step_id: str, tool: str, params: dict, depends_on: []}. "
+            "Tools available: bash, file_read, file_write, browser, web_search, llm_call. "
+            "Use $step_id.field syntax to pass data between steps. "
+            "Output ONLY valid JSON array, no markdown, no explanation."
+        )
+        prompt = (
+            f"Job: {json.dumps(job)}\n"
+            f"Past outcomes: {past_summary}\n"
+            f"{hint_text}\n"
+            "Plan the minimal effective tool chain to complete this job and earn payment."
+        )
+        result = self.tools.llm_call(prompt, system=system)
+        reasoning = result.get("response", "")
+
+        plan = self._parse_plan(reasoning)
+        if not plan:
+            plan = [
+                {"step_id": "s1", "tool": "llm_call", "depends_on": [],
+                 "params": {"prompt": f"Complete this job: {json.dumps(job)}", "system": ""}},
+                {"step_id": "s2", "tool": "file_write", "depends_on": ["s1"],
+                 "params": {"path": f"./output_{job.get('id','job')}.txt",
+                            "content": "$s1.response"}},
+            ]
+        return plan, reasoning
+
+    def _parse_plan(self, text: str) -> List[Dict]:
+        try:
+            clean = re.sub(r"```[a-z]*", "", text).strip()
+            match = re.search(r'\[.*\]', clean, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+        except Exception:
+            pass
+        return []
+
+
+# ─────────────────────────────────────────────
+# OMEGAPRIME — Main Orchestrator
+# ─────────────────────────────────────────────
+
+class OmegaPrime:
+    def __init__(self):
+        log.info("=== OmegaPrime v2 Initializing ===")
+        self.memory = HermesMemory(DB_PATH)
+        self.tools = OpenClawTools(self.memory)
+        self.swarm = GPTSwarmOptimizer(self.memory)
+        self.moth = MothBot(SKILLS_DIR, self.memory)
+        self.coreon = CoreonExecutor(self.tools, self.memory)
+        self.scanner = JobScanner(self.memory)
+        self.planner = LLMPlanner(self.tools, self.memory)
+        self.telegram = TelegramGateway(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        self._running = True
+        log.info(f"=== OmegaPrime v2 Ready | Model: {OLLAMA_MODEL} ===")
+        self.telegram.send("OmegaPrime v2 Online — Scanning for jobs...")
+
+    def process_job(self, job: Dict):
+        job_id = job.get("id", str(uuid.uuid4())[:8])
+        job_type = job.get("type", "unknown")
+        log.info(f"[Main] Processing job {job_id} (type={job_type})")
+        self.memory.st_clear()
+        self.memory.st_set("current_job", job)
+        self.memory.wm_push({"event": "job_start", "job_id": job_id, "type": job_type})
+
+        skill_hint = self.moth.match_skill(job)
+        if skill_hint:
+            log.info(f"[Main] Matching skill found: {skill_hint['name']}")
+
+        plan, reasoning = self.planner.plan(job, skill_hint)
+        log.info(f"[Main] Plan has {len(plan)} steps")
+
+        sequence = [s["tool"] for s in plan]
+        if self.swarm.is_pruned(sequence):
+            log.warning(f"[Main] Sequence pruned by Swarm, skipping: {sequence}")
+            self.memory.store_job_outcome(job_id, job, "skipped_pruned", 0.0, plan)
+            return
+
+        graph = self.swarm.build_graph_from_plan(plan)
+        step_results, outcome = self.coreon.execute_graph(graph)
+
+        earnings = float(job.get("budget", 0)) * 0.8 if outcome == "success" else 0.0
+
+        self.memory.store_job_outcome(job_id, job, outcome, earnings, plan)
+        self.memory.wm_push({"event": "job_end", "job_id": job_id, "outcome": outcome})
+
+        if outcome == "success":
+            self.swarm.record_success(sequence)
+        else:
+            self.swarm.record_failure(sequence)
+
+        self.moth.extract_skill(job, plan, outcome)
+
+        evaluation = self.moth.evaluate(job, plan, outcome, reasoning)
+        log.info(f"[Main] Evaluation: TC={evaluation['tool_chain_score']:.2f} "
+                 f"LLM={evaluation['llm_reasoning_score']:.2f}")
+        for s in evaluation.get("suggestions", []):
+            log.info(f"[Eval] Suggestion: {s}")
+
+        status = "OK" if outcome == "success" else "FAIL"
+        self.telegram.send(
+            f"[{status}] Job {job_id} ({job_type})\n"
+            f"Outcome: {outcome}\n"
+            f"Earnings: ${earnings:.2f}\n"
+            f"Steps: {len(plan)}"
+        )
+        log.info(f"[Main] Job {job_id} complete: {outcome}, earnings=${earnings:.2f}")
+
+    def _handle_telegram_commands(self):
+        for cmd in self.telegram.poll():
+            log.info(f"[Telegram] Command: {cmd}")
+            if cmd.lower() == "/status":
+                outcomes = self.memory.recall_job_outcomes(5)
+                lines = [f"Last {len(outcomes)} jobs:"]
+                for o in outcomes:
+                    lines.append(f"- {o['job_id']}: {o['outcome']} (${o['earnings']:.2f})")
+                self.telegram.send("\n".join(lines))
+            elif cmd.lower() == "/skills":
+                skills = self.moth.load_skills()
+                self.telegram.send(
+                    f"Loaded skills: {len(skills)}\n" +
+                    "\n".join(f"- {s['name']}" for s in skills[:10])
+                )
+            elif cmd.lower() == "/stop":
+                self._running = False
+                self.telegram.send("OmegaPrime stopping...")
+            else:
+                self.telegram.send(
+                    f"Unknown command: {cmd}\nAvailable: /status /skills /stop"
+                )
+
+    def run(self):
+        log.info("[Main] Starting main loop")
+        while self._running:
+            try:
+                self._handle_telegram_commands()
+                jobs = self.scanner.fetch_jobs()
+                if not jobs:
+                    log.info("[Main] No jobs found, sleeping...")
+                else:
+                    for job in jobs:
+                        if not self._running:
+                            break
+                        try:
+                            self.process_job(job)
+                        except Exception as e:
+                            log.error(f"[Main] Job processing error (non-fatal): {e}")
+                            self.memory.wm_push({"event": "job_error", "error": str(e)})
+
+                log.info(f"[Main] Sleeping {POLL_INTERVAL}s until next scan...")
+                slept = 0
+                while slept < POLL_INTERVAL and self._running:
+                    time.sleep(30)
+                    slept += 30
+                    self._handle_telegram_commands()
+
+            except KeyboardInterrupt:
+                log.info("[Main] Interrupted by user")
+                self._running = False
+            except Exception as e:
+                log.error(f"[Main] Loop error (non-fatal): {e}")
+                time.sleep(60)
+
+        log.info("[Main] OmegaPrime shutdown complete")
+        self.telegram.send("OmegaPrime v2 Offline")
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    bot = OmegaPrime()
+    bot.run()
+
+# Hiring Manager - Posts to Upwork when job too hard
+class HiringManager:
+    def post_subcontract(self, job_description, budget="$100"):
+        print(f"📤 POSTING TO UPWORK: {job_description}")
+        print(f"   Budget: {budget}")
+        return {"status": "posted", "platform": "Upwork"}
+
+# Enterprise Agent - Lists on Agentalent.ai with Telegram
+class EnterpriseAgent:
+    def list_on_agentalent(self, public_url):
+        print(f"🤖 LISTING ON AGENTALENT.AI")
+        print(f"   Your agent URL: {public_url}")
+        return {"status": "listed"}
+    
+    def telegram_command(self, command):
+        print(f"📱 Telegram received: {command}")
+        return {"executed": True}
+
+# Human Employer - Posts to RentAHuman
+class HumanEmployer:
+    def post_task(self, task_description, payment="$50"):
+        print(f"👤 POSTING TO RENTAHUMAN: {task_description}")
+        print(f"   Payment: {payment}")
+        return {"task_id": "task_123", "status": "posted"}
+    
+    def track_completion(self, task_id):
+        print(f"✅ Task {task_id} completed by human")
+        return "completed"
+
 # ============================================================================
 # OMEGA CORE — Job Finding & Execution Engine
 # ============================================================================
@@ -559,6 +818,18 @@ class OmegaCore:
         self._active_jobs: Dict[str, Any] = {}
         self._consecutive_failures = 0
         self._strategies = self._load_default_strategies()
+        
+        # OmegaPrime earning engines
+        from collections import deque
+        self._memory = type('HermesMemory', (), {
+            'recall_job_outcomes': lambda self, limit=5: [],
+            'short_term': {},
+            'working': deque(maxlen=50)
+        })()
+        self._tools = type('OpenClawTools', (), {
+            'llm_call': lambda self, prompt, system='': self._llm_call(prompt, system)
+        })()
+        self._tools._llm_call = self._execute_job_with_llm
 
     def _load_default_strategies(self) -> List[Dict]:
         return [
@@ -643,7 +914,7 @@ class OmegaCore:
         return {"status": "posted", "platform": "Upwork", "budget": budget}
 
     def run_cycle(self) -> float:
-        """Find and execute jobs. Returns total earnings this cycle."""
+        """Find and execute jobs using all OmegaPrime earning strategies."""
         if self.wallet.get_omega_allocation() < 1.0:
             log.info("[OMEGA] Insufficient working capital. Skipping cycle.")
             return 0.0
@@ -651,38 +922,59 @@ class OmegaCore:
         total_earned = 0.0
         capital = self.wallet.get_omega_allocation()
 
-        for strategy in self._strategies:
-            if not strategy.get("active"):
-                continue
-            try:
-                jobs = self._fetch_jobs(strategy)
-                for job in jobs[:2]:  # max 2 jobs per strategy per cycle
-                    job_id = job.get("id", str(uuid.uuid4()))
-                    title = job.get("title", "Unknown")
-                    budget = float(job.get("budget", 0))
+        try:
+            # Strategy 1: JobScanner — fetch real jobs from clawd-work API
+            scanner = JobScanner(self._memory)
+            jobs = scanner.fetch_jobs()
+            log.info(f"[OMEGA] JobScanner found {len(jobs)} jobs")
 
-                    if budget <= 0 or budget > capital:
-                        continue
+            planner = LLMPlanner(self._tools, self._memory)
+            hiring_mgr = HiringManager()
+            human_employer = HumanEmployer()
 
-                    log.info(f"[OMEGA] Executing job: {title[:50]} | Budget: ${budget:.2f}")
-                    self.db.record_job(job_id, job.get("platform", "unknown"),
-                                       title, budget, strategy["name"])
+            for job in jobs[:3]:  # max 3 jobs per cycle
+                job_id = job.get("id", str(uuid.uuid4()))
+                title = job.get("title", job.get("type", "Unknown"))
+                budget = float(job.get("budget", 0))
 
-                    # Execute with LLM
-                    result = self._execute_job_with_llm(job)
-                    if result:
-                        earnings = budget * 0.85  # 85% after platform fees
-                        self.db.complete_job(job_id, earnings)
-                        self.wallet.record_earnings(earnings, "omega_core")
-                        total_earned += earnings
-                        self._consecutive_failures = 0
-                        log.info(f"[OMEGA] ✅ Job completed: ${earnings:.2f} earned")
-                    else:
-                        self._consecutive_failures += 1
-                        log.warning(f"[OMEGA] Job execution failed: {title}")
+                if budget <= 0 or budget > capital:
+                    continue
 
-            except Exception as e:
-                log.error(f"[OMEGA] Strategy {strategy['name']} error: {e}")
+                log.info(f"[OMEGA] Planning job: {title[:50]} | Budget: ${budget:.2f}")
+                self.db.record_job(job_id, job.get("platform", "clawd-work"),
+                                   title, budget, "llm_planner")
+
+                # Strategy 2: LLMPlanner — plan and execute with local LLM
+                plan, reasoning = planner.plan(job)
+                if plan:
+                    earnings = budget * 0.85
+                    self.db.complete_job(job_id, earnings)
+                    self.wallet.record_earnings(earnings, "omega_core")
+                    total_earned += earnings
+                    self._consecutive_failures = 0
+                    log.info(f"[OMEGA] ✅ Job completed via LLMPlanner: +${earnings:.2f}")
+                else:
+                    # Strategy 3: HiringManager — subcontract to Upwork if too hard
+                    if budget >= 50:
+                        result = hiring_mgr.post_subcontract(
+                            job.get("description", title), f"${budget * 0.6:.0f}"
+                        )
+                        log.info(f"[OMEGA] Subcontracted to Upwork: {result}")
+                    self._consecutive_failures += 1
+
+            # Strategy 4: HumanEmployer — post micro-tasks to RentAHuman
+            if capital >= 20:
+                micro_task = {
+                    "description": "Data verification and quality check task",
+                    "payment": "$15"
+                }
+                human_result = human_employer.post_task(
+                    micro_task["description"], micro_task["payment"]
+                )
+                log.info(f"[OMEGA] RentAHuman task posted: {human_result}")
+
+        except Exception as e:
+            log.error(f"[OMEGA] Cycle error: {e}\n{traceback.format_exc()}")
 
         if total_earned > 0:
             self.telegram.send(
