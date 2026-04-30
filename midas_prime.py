@@ -35,6 +35,7 @@ from collections import deque, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+from autonomous_impulse import AutonomousImpulse
 
 try:
     import requests
@@ -3543,6 +3544,7 @@ class FlywheelBrain:
         self.pantheon = PantheonNetwork(
             self.db, self.omega, self.telegram, self.config
         )
+        self.impulse = AutonomousImpulse("MidasPrime")
         self._running = False
         self._cycle_count = 0
         self._start_time = datetime.utcnow()
@@ -3676,6 +3678,10 @@ class FlywheelBrain:
             try:
                 self._cycle_count += 1
                 log.info(f"[FLYWHEEL] ═══ Cycle #{self._cycle_count} ═══")
+
+                # 0. Autonomous Contemplation — Profit Focus
+                focus = self.impulse.think("How can I maximize profit for the Forgemaster in this cycle?")
+                log.info(f"🥇 MidasPrime Autonomous Focus: {focus[0]} - Purpose: Making money for the Forgemaster.")
 
                 # 1. OmegaCore — find and do jobs, earn money
                 omega_earnings = self.omega.run_cycle()
