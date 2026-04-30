@@ -93,6 +93,9 @@ class Config:
     WORK_ALLOCATION_PCT     = float(os.getenv("WORK_ALLOCATION_PCT", "0.30"))   # 30% to working capital
     RESERVE_PCT             = float(os.getenv("RESERVE_PCT", "0.10"))           # 10% reserve
 
+    # Earning Categories
+    REVENUE_CATEGORIES = ["trading", "freelance", "staking", "data_arbitrage", "ai_saas"]
+
     # Flywheel
     FLYWHEEL_INTERVAL       = int(os.getenv("FLYWHEEL_INTERVAL", "1800"))   # 30 min cycles
     META_REWRITE_INTERVAL   = int(os.getenv("META_REWRITE_INTERVAL", "7200")) # 2 hr meta rewrites
@@ -357,13 +360,14 @@ class WalletManager:
             )
             return balance
 
-    def record_earnings(self, amount: float, source: str = "omega") -> None:
-        """Record earnings from job completion and re-allocate."""
+    def record_earnings(self, amount: float, source: str = "omega", category: str = "freelance") -> None:
+        """Record earnings from any category and re-allocate."""
         with self._lock:
             self.db.record_transaction("earning", amount, source,
-                                       f"Job earnings from {source}")
+                                       f"Revenue from {category} via {source}")
             self._allocate(amount)
             self._check_auto_withdraw()
+            log.info(f"[MIDAS] New gold in the War Chest: ${amount:.2f} from {category}")
 
     def record_trade_profit(self, amount: float) -> None:
         """Record trading P&L and re-allocate."""
